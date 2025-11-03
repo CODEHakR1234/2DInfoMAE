@@ -274,25 +274,22 @@ class InfoMAE(nn.Module):
         else:
             x, mask, ids_restore = self.random_masking(x, mask_ratio)
         
+        # Prepare surprisal bias BEFORE adding cls token
+        surprisal_bias = None
+        if self.use_surprisal_attention and lambda_weight > 0:
+            B = x.shape[0]
+            N_keep = x.shape[1]  # Number of kept patches (before cls token)
+            # Use mean surprisal for simplicity
+            mean_surprisal = self.surprisal_ema.mean()
+            # Create bias for cls (1) + kept patches (N_keep)
+            surprisal_bias = torch.ones(B, 1 + N_keep, device=x.device) * mean_surprisal
+        
         # Add cls token
         cls_token = self.cls_token + self.pos_embed[:, :1, :]
         cls_tokens = cls_token.expand(x.shape[0], -1, -1)
         x = torch.cat((cls_tokens, x), dim=1)
-        
-        # Prepare surprisal bias (only for kept tokens after masking)
-        surprisal_bias = None
-        if self.use_surprisal_attention and lambda_weight > 0:
-            # x now has shape [B, N_keep, D] where N_keep is number of kept patches
-            # We need surprisal for the kept patches only
-            # surprisal_bias should match the length of x (after adding cls token)
-            # For now, use a simplified version with uniform surprisal for kept tokens
-            B = x.shape[0]
-            N_with_cls = x.shape[0]  # Will be N_keep + 1 after cls token is added
-            # Create surprisal bias with same length as the sequence (1 for cls + N_keep for patches)
-            # Use mean surprisal for all tokens as a simplification
-            mean_surprisal = self.surprisal_ema.mean()
-            surprisal_bias = torch.ones(B, 1 + x.shape[1], device=x.device) * mean_surprisal
-            # After cls token is added, this will be [B, N_keep + 1]
+        # Now x shape: [B, 1 + N_keep, D]
+        # surprisal_bias shape: [B, 1 + N_keep] - matches!
         
         # Apply blocks
         for blk in self.blocks:
@@ -346,9 +343,12 @@ class InfoMAE(nn.Module):
         # Compute surprisal (reconstruction error) per patch
         with torch.no_grad():
             surprisal = loss.detach()
-            # Update EMA
+            # Update EMA (only for masked patches)
             if self.training:
-                batch_surprisal = surprisal.mean(dim=0)  # Average over batch
+                # Only update surprisal for masked patches (where mask == 1)
+                masked_surprisal = surprisal * mask
+                num_masked = mask.sum(dim=0).clamp(min=1)  # Avoid division by zero
+                batch_surprisal = masked_surprisal.sum(dim=0) / num_masked
                 self.surprisal_ema = (self.surprisal_momentum * self.surprisal_ema + 
                                       (1 - self.surprisal_momentum) * batch_surprisal)
         
