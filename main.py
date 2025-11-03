@@ -232,6 +232,11 @@ def train(config: Config):
     
     model = model.to(device)
     
+    # ✅ Initialize epoch-level surprisal cache
+    if hasattr(model, 'use_epoch_cache') and model.use_epoch_cache:
+        dataset_size = len(train_dataset)
+        model.initialize_epoch_cache(dataset_size, device='cpu')  # CPU to save GPU memory
+    
     # Count parameters
     total_params = sum(p.numel() for p in model.parameters())
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)

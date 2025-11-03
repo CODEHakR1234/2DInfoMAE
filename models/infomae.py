@@ -149,8 +149,45 @@ class InfoMAE(nn.Module):
         self.register_buffer('surprisal_ema', torch.ones(self.num_patches))
         self.surprisal_momentum = 0.9
         
+        # ✅ EPOCH-LEVEL SURPRISAL CACHE for image-specific adaptive masking
+        # Instead of using position-based EMA (which becomes flat across dataset),
+        # we cache the actual surprisal from previous epoch for each image.
+        # This provides true image-specific, content-based surprisal.
+        #
+        # Key insight: Batch-level cache fails because different images appear in each batch.
+        # Epoch-level cache works because same images appear across epochs!
+        #
+        # Memory: ~100 MB for ImageNet-100 (130k images × 196 patches × 4 bytes)
+        # Can be stored on CPU to save GPU memory.
+        self.use_epoch_cache = True  # Enable/disable epoch cache
+        self.surprisal_memory = None  # Will be initialized based on dataset size
+        self.surprisal_initialized = None  # Track which images have cached surprisal
+        
         self.initialize_weights()
         
+    def initialize_epoch_cache(self, dataset_size: int, device: str = 'cpu'):
+        """
+        Initialize epoch-level surprisal cache
+        
+        Args:
+            dataset_size: Number of images in the dataset
+            device: 'cpu' or 'cuda' - CPU recommended to save GPU memory
+        """
+        print(f"Initializing epoch cache for {dataset_size} images...")
+        print(f"Memory: {dataset_size * self.num_patches * 4 / 1e6:.2f} MB on {device}")
+        
+        self.surprisal_memory = torch.zeros(
+            dataset_size, self.num_patches,
+            dtype=torch.float32,
+            device=device
+        )
+        self.surprisal_initialized = torch.zeros(
+            dataset_size,
+            dtype=torch.bool,
+            device=device
+        )
+        print("✅ Epoch cache initialized!")
+    
     def initialize_weights(self):
         """Initialize weights"""
         # Position embeddings
@@ -213,16 +250,28 @@ class InfoMAE(nn.Module):
         
         return x_masked, mask, ids_restore
     
-    def adaptive_masking_strategy(self, x, mask_ratio, alpha=3.0, gamma=1.0):
+    def adaptive_masking_strategy(self, x, mask_ratio, alpha=3.0, gamma=1.0, surprisal_override=None):
         """
         Adaptive masking based on surprisal
         p_mask(i) = sigmoid(alpha - gamma * S_i)
         High surprisal → low mask probability → learn more often
+        
+        Args:
+            x: [N, L, D] input tokens
+            mask_ratio: target masking ratio
+            alpha: sigmoid offset parameter
+            gamma: surprisal weight
+            surprisal_override: [N, L] optional cached surprisal from previous iteration
         """
         N, L, D = x.shape
         
-        # Use EMA of surprisal
-        surprisal = self.surprisal_ema.unsqueeze(0).expand(N, -1)  # [B, L]
+        # ✅ Use epoch-cached surprisal if available (image-specific, content-based)
+        # Otherwise fallback to EMA (position-based, less accurate)
+        if surprisal_override is not None and self.use_epoch_cache:
+            surprisal = surprisal_override  # [B, L] - from previous epoch
+        else:
+            # Fallback to EMA
+            surprisal = self.surprisal_ema.unsqueeze(0).expand(N, -1)  # [B, L]
         
         # Compute masking probabilities
         mask_probs = torch.sigmoid(alpha - gamma * surprisal)
@@ -262,15 +311,28 @@ class InfoMAE(nn.Module):
         
         return x_masked, mask, ids_restore
     
-    def forward_encoder(self, x, mask_ratio, lambda_weight=0.0, alpha=3.0, gamma=1.0):
-        """Encoder with optional surprisal-weighted attention"""
+    def forward_encoder(self, x, mask_ratio, lambda_weight=0.0, alpha=3.0, gamma=1.0, surprisal_override=None):
+        """
+        Encoder with optional surprisal-weighted attention
+        
+        Args:
+            x: [N, C, H, W] input images
+            mask_ratio: masking ratio
+            lambda_weight: surprisal attention weight
+            alpha: adaptive masking offset
+            gamma: adaptive masking surprisal weight
+            surprisal_override: [N, L] optional cached surprisal from previous iteration
+        """
         # Patch embedding
         x = self.patch_embed(x)
         x = x + self.pos_embed[:, 1:, :]
         
         # Masking
         if self.adaptive_masking and self.training:
-            x, mask, ids_restore = self.adaptive_masking_strategy(x, mask_ratio, alpha, gamma)
+            # ✅ Pass cached surprisal to adaptive masking
+            x, mask, ids_restore = self.adaptive_masking_strategy(
+                x, mask_ratio, alpha, gamma, surprisal_override=surprisal_override
+            )
         else:
             x, mask, ids_restore = self.random_masking(x, mask_ratio)
         
@@ -341,29 +403,70 @@ class InfoMAE(nn.Module):
         loss = loss.mean(dim=-1)  # [N, L], mean loss per patch
         
         # Compute surprisal (reconstruction error) per patch
+        # ✅ IMPORTANT: Surprisal is only meaningful for masked patches!
+        # Unmasked patches have low reconstruction error (original info available)
+        # but they don't contribute to the loss, so their "surprisal" is meaningless.
         with torch.no_grad():
-            surprisal = loss.detach()
+            # Only compute surprisal for masked patches (zero out unmasked)
+            surprisal = loss.detach() * mask  # [N, L] - masked only!
+            
             # Update EMA (only for masked patches)
             if self.training:
-                # Only update surprisal for masked patches (where mask == 1)
-                masked_surprisal = surprisal * mask
                 num_masked = mask.sum(dim=0).clamp(min=1)  # Avoid division by zero
-                batch_surprisal = masked_surprisal.sum(dim=0) / num_masked
+                batch_surprisal = surprisal.sum(dim=0) / num_masked
                 self.surprisal_ema = (self.surprisal_momentum * self.surprisal_ema + 
                                       (1 - self.surprisal_momentum) * batch_surprisal)
         
         # Loss only on masked patches
         loss = (loss * mask).sum() / mask.sum()
-        return loss, surprisal
+        return loss, surprisal  # surprisal: [N, L] with unmasked = 0
     
-    def forward(self, imgs, mask_ratio=0.75, lambda_weight=0.0, alpha=3.0, gamma=1.0):
+    def forward(self, imgs, mask_ratio=0.75, lambda_weight=0.0, alpha=3.0, gamma=1.0, 
+                image_ids=None):
         """
-        Forward pass
-        Returns: loss, pred, mask, surprisal, latent
+        Forward pass with epoch-level surprisal caching
+        
+        Args:
+            imgs: [N, C, H, W] input images
+            mask_ratio: masking ratio
+            lambda_weight: surprisal attention weight
+            alpha: adaptive masking offset
+            gamma: adaptive masking surprisal weight
+            image_ids: [N] image indices for epoch caching (optional)
+        
+        Returns:
+            loss: reconstruction loss
+            pred: [N, L, p*p*3] predictions
+            mask: [N, L] mask (0=keep, 1=remove)
+            surprisal: [N, L] surprisal (reconstruction error, masked patches only)
+            latent: [N, N_keep+1, D] latent representations
         """
-        latent, mask, ids_restore = self.forward_encoder(imgs, mask_ratio, lambda_weight, alpha, gamma)
+        # ✅ Get cached surprisal from epoch memory if available
+        surprisal_override = None
+        if image_ids is not None and self.use_epoch_cache and self.surprisal_memory is not None:
+            # Move image_ids to same device as memory (usually CPU) for indexing
+            image_ids_cpu = image_ids.cpu() if image_ids.device != self.surprisal_memory.device else image_ids
+            
+            # Check if all images have cached surprisal
+            if self.surprisal_initialized[image_ids_cpu].all():
+                # Get from memory (CPU or GPU)
+                surprisal_override = self.surprisal_memory[image_ids_cpu].to(imgs.device)
+        
+        # Forward pass
+        latent, mask, ids_restore = self.forward_encoder(
+            imgs, mask_ratio, lambda_weight, alpha, gamma, 
+            surprisal_override=surprisal_override
+        )
         pred = self.forward_decoder(latent, ids_restore)
         loss, surprisal = self.forward_loss(imgs, pred, mask)
+        
+        # ✅ Save surprisal to epoch memory (during training)
+        if self.training and image_ids is not None and self.use_epoch_cache and self.surprisal_memory is not None:
+            # Move to same device as memory (usually CPU) for indexing
+            image_ids_cpu = image_ids.cpu() if image_ids.device != self.surprisal_memory.device else image_ids
+            surprisal_cpu = surprisal.detach().to(self.surprisal_memory.device)
+            self.surprisal_memory[image_ids_cpu] = surprisal_cpu
+            self.surprisal_initialized[image_ids_cpu] = True
         
         return loss, pred, mask, surprisal, latent
     

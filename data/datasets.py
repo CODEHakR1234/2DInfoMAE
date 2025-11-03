@@ -137,10 +137,45 @@ def build_dataset(dataset_name: str, root: str, split: str = 'train',
     return dataset
 
 
+class IndexedDataset(Dataset):
+    """
+    Wrapper that returns dataset index along with data
+    This is needed for epoch-level surprisal caching
+    """
+    def __init__(self, dataset):
+        self.dataset = dataset
+    
+    def __len__(self):
+        return len(self.dataset)
+    
+    def __getitem__(self, idx):
+        data = self.dataset[idx]
+        # Return: (idx, image, label) or (idx, *data)
+        if isinstance(data, tuple):
+            return (idx,) + data
+        else:
+            return idx, data
+
+
 def build_dataloader(dataset: Dataset, batch_size: int, num_workers: int = 8,
                     shuffle: bool = True, drop_last: bool = True,
-                    pin_memory: bool = True) -> DataLoader:
-    """Build dataloader"""
+                    pin_memory: bool = True, return_index: bool = True) -> DataLoader:
+    """
+    Build dataloader
+    
+    Args:
+        dataset: PyTorch dataset
+        batch_size: batch size
+        num_workers: number of workers
+        shuffle: whether to shuffle
+        drop_last: whether to drop last incomplete batch
+        pin_memory: whether to pin memory
+        return_index: whether to return dataset index (for epoch caching)
+    """
+    
+    # Wrap dataset to return index if needed
+    if return_index:
+        dataset = IndexedDataset(dataset)
     
     loader = DataLoader(
         dataset,

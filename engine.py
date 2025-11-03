@@ -59,16 +59,27 @@ class Trainer:
         
         pbar = tqdm(train_loader, desc=f"Epoch {epoch}/{self.config.training.epochs}")
         
-        for batch_idx, (images, _) in enumerate(pbar):
+        for batch_idx, batch_data in enumerate(pbar):
+            # Unpack batch (with or without image_ids)
+            if len(batch_data) == 3:
+                # (image_ids, images, labels) - from IndexedDataset
+                image_ids, images, _ = batch_data
+                image_ids = image_ids.to(self.device)
+            else:
+                # (images, labels) - regular dataset
+                images, _ = batch_data
+                image_ids = None
+            
             images = images.to(self.device)
             
-            # Forward pass
+            # Forward pass (with epoch cache if image_ids provided)
             loss, pred, mask, surprisal, latent = self.model(
                 images,
                 mask_ratio=self.config.model.mask_ratio,
                 lambda_weight=lambda_weight,
                 alpha=alpha,
                 gamma=gamma,
+                image_ids=image_ids,  # ✅ Pass image_ids for epoch caching
             )
             
             # Compute full loss with IB term
