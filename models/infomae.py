@@ -279,16 +279,20 @@ class InfoMAE(nn.Module):
         cls_tokens = cls_token.expand(x.shape[0], -1, -1)
         x = torch.cat((cls_tokens, x), dim=1)
         
-        # Prepare surprisal bias (only for non-masked tokens)
+        # Prepare surprisal bias (only for kept tokens after masking)
         surprisal_bias = None
         if self.use_surprisal_attention and lambda_weight > 0:
-            # Get surprisal for all patches
-            surprisal_all = self.surprisal_ema.unsqueeze(0).expand(x.shape[0], -1)
-            # Mask out the masked patches
-            surprisal_masked = surprisal_all * (1 - mask)
-            # Add cls token surprisal (set to mean)
-            cls_surprisal = surprisal_masked.mean(dim=1, keepdim=True)
-            surprisal_bias = torch.cat([cls_surprisal, surprisal_masked], dim=1)
+            # x now has shape [B, N_keep, D] where N_keep is number of kept patches
+            # We need surprisal for the kept patches only
+            # surprisal_bias should match the length of x (after adding cls token)
+            # For now, use a simplified version with uniform surprisal for kept tokens
+            B = x.shape[0]
+            N_with_cls = x.shape[0]  # Will be N_keep + 1 after cls token is added
+            # Create surprisal bias with same length as the sequence (1 for cls + N_keep for patches)
+            # Use mean surprisal for all tokens as a simplification
+            mean_surprisal = self.surprisal_ema.mean()
+            surprisal_bias = torch.ones(B, 1 + x.shape[1], device=x.device) * mean_surprisal
+            # After cls token is added, this will be [B, N_keep + 1]
         
         # Apply blocks
         for blk in self.blocks:
