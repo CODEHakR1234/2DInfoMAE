@@ -318,7 +318,15 @@ def train(config: Config):
             print("\nGenerating visualizations...")
             
             # Get a batch for visualization
-            sample_images, _ = next(iter(val_loader))
+            # ✅ FIXED: Handle IndexedDataset (image_ids, images, labels)
+            batch_data = next(iter(val_loader))
+            if len(batch_data) == 3:
+                # (image_ids, images, labels) - from IndexedDataset
+                _, sample_images, _ = batch_data
+            else:
+                # (images, labels) - from regular dataset
+                sample_images, _ = batch_data
+            sample_images = sample_images.to(device)
             
             # Reconstruction visualization
             vis_path = os.path.join(
@@ -389,6 +397,7 @@ def evaluate_linear_probe(config: Config):
         batch_size=config.eval.probe_batch_size,
         num_workers=config.training.num_workers,
         shuffle=True,
+        return_index=False,  # Linear probe doesn't need image_ids
     )
     
     val_loader = build_dataloader(
@@ -396,6 +405,7 @@ def evaluate_linear_probe(config: Config):
         batch_size=config.eval.probe_batch_size,
         num_workers=config.training.num_workers,
         shuffle=False,
+        return_index=False,  # Linear probe doesn't need image_ids
     )
     
     # Load model

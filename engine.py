@@ -307,7 +307,12 @@ class LinearProbe:
         
         criterion = nn.CrossEntropyLoss()
         
-        for images, labels in tqdm(train_loader, desc="Linear probe training"):
+        for batch_data in tqdm(train_loader, desc="Linear probe training"):
+            # ✅ FIXED: Handle IndexedDataset (image_ids, images, labels)
+            if len(batch_data) == 3:
+                _, images, labels = batch_data
+            else:
+                images, labels = batch_data
             images, labels = images.to(self.device), labels.to(self.device)
             
             # Extract features
@@ -341,7 +346,12 @@ class LinearProbe:
         
         criterion = nn.CrossEntropyLoss()
         
-        for images, labels in tqdm(val_loader, desc="Linear probe evaluation"):
+        for batch_data in tqdm(val_loader, desc="Linear probe evaluation"):
+            # ✅ FIXED: Handle IndexedDataset (image_ids, images, labels)
+            if len(batch_data) == 3:
+                _, images, labels = batch_data
+            else:
+                images, labels = batch_data
             images, labels = images.to(self.device), labels.to(self.device)
             
             # Extract features

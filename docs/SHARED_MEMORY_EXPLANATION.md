@@ -157,32 +157,25 @@ factor = 2~4 (transform, queue, overhead)
 
 ### 실제 예시
 
-#### 예시 1: CIFAR-100 (작은 이미지)
+**✅ 중요: 모든 데이터셋이 224×224로 통일됨!**
+
+코드에서 `build_transform(img_size=224)`를 사용하므로:
+- CIFAR-100: 원본 32×32 → **224×224로 리사이즈** ✅
+- ImageNet-100: 원본 224×224 → **224×224 유지** ✅
+- STL-10: 원본 96×96 → **224×224로 리사이즈** ✅
+
+#### 예시: InfoMAE (모든 데이터셋 동일)
 ```
 num_workers = 8
 batch_size = 256
-이미지 = 32×32×3 = 3KB
-
-필요 메모리 = 8 × 256 × 3KB × 2 = ~12MB ✅ (64MB 안에 가능)
-```
-
-#### 예시 2: ImageNet-100 (큰 이미지) - **문제 발생!**
-```
-num_workers = 8
-batch_size = 256
-이미지 = 224×224×3 = 150KB
-
-필요 메모리 = 8 × 256 × 150KB × 2 = ~600MB ❌ (64MB 초과!)
-```
-
-#### 예시 3: InfoMAE (우리 케이스)
-```
-num_workers = 8
-batch_size = 256
-이미지 = 224×224×3 = 150KB
+이미지 = 224×224×3 = 150KB (float32)
 IndexedDataset 오버헤드 포함
 
-필요 메모리 ≈ 8 × 256 × 150KB × 3 = ~900MB ❌ (64MB 초과!)
+필요 메모리 = 8 × 256 × 150KB × 3 (transform, queue, overhead)
+           ≈ ~900MB ❌ (64MB 초과!)
+
+Docker 기본 shm = 64MB
+→ 약 14배 부족! 💥
 ```
 
 ---
@@ -231,11 +224,13 @@ tmpfs /dev/shm tmpfs defaults,size=2g 0 0
 
 ```python
 # Before:
-batch_size = 256  # 256 × 150KB = 38MB per worker
+batch_size = 256  # 256 × 150KB = 38MB per worker (224×224 이미지)
 
 # After:
 batch_size = 128  # 128 × 150KB = 19MB per worker
                   # 8 workers × 19MB = 152MB (여전히 부족하지만 완화)
+                  
+# 하지만 num_workers를 줄이는 것이 더 효과적!
 ```
 
 ---
