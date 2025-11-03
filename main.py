@@ -130,9 +130,11 @@ def build_optimizer(model: nn.Module, config: Config) -> torch.optim.Optimizer:
 def build_scheduler(optimizer: torch.optim.Optimizer, config: Config):
     """Build learning rate scheduler"""
     if config.training.scheduler == 'cosine':
+        # Ensure T_max is at least 1 to avoid division by zero
+        T_max = max(1, config.training.epochs - config.training.warmup_epochs)
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
             optimizer,
-            T_max=config.training.epochs - config.training.warmup_epochs,
+            T_max=T_max,
             eta_min=config.training.min_lr,
         )
     elif config.training.scheduler == 'step':

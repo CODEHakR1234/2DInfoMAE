@@ -4,7 +4,7 @@ Training and evaluation engine for InfoMAE
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
-from typing import Dict, Optional
+from typing import Dict, Optional, Tuple
 import time
 import datetime
 from tqdm import tqdm

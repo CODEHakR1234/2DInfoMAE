@@ -6,7 +6,63 @@
 
 ## 🚨 Critical Bugs (치명적 버그)
 
-### 1. **Surprisal Bias 차원 오류** ⭐⭐⭐
+### 1. **Mutual Information 계산 시 텐서 차원 불일치** ⭐⭐⭐ ✅ FIXED
+
+**위치**: `utils/losses.py`, line 86
+
+**문제:**
+```python
+# Line 86 (원본)
+correlation = torch.corrcoef(torch.stack([s.flatten(), z_pooled.flatten().mean()]))
+#                                         ^^^^^^^^^^^   ^^^^^^^^^^^^^^^^^^^^^^^^
+#                                         [25088]       [] (scalar!)
+```
+
+**에러 메시지:**
+```
+RuntimeError: stack expects each tensor to be equal size, but got [25088] at entry 0 and [] at entry 1
+```
+
+**근본 원인:**
+- `s.flatten()`: shape `[B*N]` = `[25088]` ✅ 벡터
+- `z_pooled.flatten().mean()`: shape `[]` ❌ 스칼라!
+- `torch.stack`은 같은 shape의 텐서를 요구하는데, 벡터와 스칼라를 스택하려고 시도
+
+**수정된 코드:**
+```python
+def compute_mutual_information_kl(z: torch.Tensor, s: torch.Tensor) -> torch.Tensor:
+    """
+    MI(Z;S) ≈ -0.5 * log(1 - ρ²) where ρ is correlation
+    """
+    B, N = s.shape
+    D = z.shape[-1]
+    
+    # Pool latent and expand to match surprisal dimension
+    z_pooled = z.mean(dim=1)  # [B, D]
+    s_flat = s.reshape(-1)  # [B*N]
+    
+    # Repeat z_pooled for each patch
+    z_flat = z_pooled.unsqueeze(1).expand(-1, N, -1).reshape(-1, D)  # [B*N, D]
+    z_flat_mean = z_flat.mean(dim=-1)  # [B*N] - now matches s_flat!
+    
+    # Compute Pearson correlation
+    s_norm = (s_flat - s_flat.mean()) / (s_flat.std() + 1e-8)
+    z_norm = (z_flat_mean - z_flat_mean.mean()) / (z_flat_mean.std() + 1e-8)
+    correlation = (s_norm * z_norm).mean()
+    
+    # MI approximation
+    correlation = torch.clamp(correlation, -0.999, 0.999)
+    mi = -0.5 * torch.log(1 - correlation ** 2 + 1e-8)
+    return torch.clamp(mi, min=0.0)
+```
+
+**영향**: 모델 학습 완전 실패 (첫 배치부터 crash)
+
+**상태**: ✅ **수정 완료** (2025-11-03)
+
+---
+
+### 2. **Surprisal Bias 차원 오류** ⭐⭐⭐ ✅ FIXED
 
 **위치**: `models/infomae.py`, line 280-294
 
@@ -48,9 +104,62 @@ surprisal_bias = torch.ones(B, x.shape[1], device=x.device) * mean_surprisal
 
 **영향**: 모델 forward pass 실패 가능성
 
+**상태**: ✅ **수정 완료** (2024-11-03)
+
 ---
 
-### 2. **사용되지 않는 변수**
+### 3. **CosineAnnealingLR T_max=0 Division by Zero** ⭐⭐⭐ ✅ FIXED
+
+**위치**: `main.py`, line 135
+
+**문제:**
+```python
+# Line 135 (원본)
+scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+    optimizer,
+    T_max=config.training.epochs - config.training.warmup_epochs,
+    #     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    #     10 - 10 = 0  ❌ Division by Zero!
+    eta_min=config.training.min_lr,
+)
+```
+
+**에러 메시지:**
+```
+ZeroDivisionError: integer modulo by zero
+File "torch/optim/lr_scheduler.py", line 1102, in get_lr
+    elif (self.last_epoch - 1 - self.T_max) % (2 * self.T_max) == 0:
+         ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^~~~~~~~~~~~~~~~~~
+```
+
+**근본 원인:**
+- `quick_start.sh`: `--epochs 10`
+- `config.py`: `warmup_epochs = 10` (기본값)
+- **결과**: `T_max = 10 - 10 = 0`
+- **`CosineAnnealingLR`는 `T_max > 0`이어야 함!**
+
+**수정된 코드:**
+```python
+def build_scheduler(optimizer: torch.optim.Optimizer, config: Config):
+    """Build learning rate scheduler"""
+    if config.training.scheduler == 'cosine':
+        # Ensure T_max is at least 1 to avoid division by zero
+        T_max = max(1, config.training.epochs - config.training.warmup_epochs)
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer,
+            T_max=T_max,  # ✅ 최소 1 보장!
+            eta_min=config.training.min_lr,
+        )
+    # ...
+```
+
+**영향**: quick_start.sh 또는 짧은 학습 실행 시 즉시 크래시
+
+**상태**: ✅ **수정 완료** (2025-11-03)
+
+---
+
+### 4. **사용되지 않는 변수** ✅ FIXED
 
 **위치**: `models/infomae.py`, line 290
 
@@ -254,18 +363,20 @@ Encoder/Decoder 분리가 잘 되어 있음
 
 ## 🔧 수정 우선순위
 
-### 🔥 즉시 수정 필요:
-1. **Surprisal bias 차원 오류** (Critical!)
-2. **사용되지 않는 변수 제거**
+### ✅ 수정 완료:
+1. ~~**Mutual Information 텐서 차원 불일치**~~ ✅ FIXED (2025-11-03)
+2. ~~**Surprisal bias 차원 오류**~~ ✅ FIXED (2024-11-03)
+3. ~~**사용되지 않는 변수 제거**~~ ✅ FIXED (2024-11-03)
+4. ~~**CosineAnnealingLR T_max=0 에러**~~ ✅ FIXED (2025-11-03)
 
 ### ⚡ 빠른 시일 내 수정:
-3. **Adaptive masking 효율성 개선**
-4. **Surprisal EMA 업데이트 로직**
+5. **Adaptive masking 효율성 개선**
+6. ~~**Surprisal EMA 업데이트 로직**~~ ✅ FIXED (2024-11-03)
 
 ### 📝 향후 개선:
-5. **get_attention_maps 옵션 추가**
-6. **Patchify 일반화**
-7. **시드 관리**
+7. **get_attention_maps 옵션 추가**
+8. **Patchify 일반화**
+9. **시드 관리**
 
 ---
 

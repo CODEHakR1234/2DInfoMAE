@@ -64,29 +64,40 @@ def compute_mutual_information(z: torch.Tensor, s: torch.Tensor, bins: int = 50)
 
 def compute_mutual_information_kl(z: torch.Tensor, s: torch.Tensor) -> torch.Tensor:
     """
-    Alternative MI estimation using KL divergence approximation
+    Alternative MI estimation using correlation-based approximation
     Faster but less accurate
     
-    MI(Z;S) ≈ H(S) - H(S|Z)
+    MI(Z;S) ≈ -0.5 * log(1 - ρ²) where ρ is correlation
     """
     B, N = s.shape
+    D = z.shape[-1]
     
-    # Entropy of S
-    s_mean = s.mean()
-    s_var = s.var()
-    h_s = 0.5 * torch.log(2 * np.pi * np.e * s_var + 1e-8)
-    
-    # Conditional entropy H(S|Z): approximate using prediction error
-    # This is a rough approximation
-    # In practice, we'd want to train a small network to predict S from Z
+    # Pool latent to match surprisal dimension
     z_pooled = z.mean(dim=1)  # [B, D]
     
-    # Simple linear prediction (this is a rough estimate)
-    # For better results, consider using a small MLP
-    correlation = torch.corrcoef(torch.stack([s.flatten(), z_pooled.flatten().mean()]))
+    # Average over batch dimension for simplicity
+    # This gives us a per-sample correlation estimate
+    s_flat = s.reshape(-1)  # [B*N]
     
-    # Upper bound on MI
-    mi = torch.abs(correlation[0, 1]) if correlation.numel() > 1 else torch.tensor(0.0, device=z.device)
+    # Repeat z_pooled for each patch to match surprisal dimension
+    z_flat = z_pooled.unsqueeze(1).expand(-1, N, -1).reshape(-1, D)  # [B*N, D]
+    z_flat_mean = z_flat.mean(dim=-1)  # [B*N] - average across feature dimension
+    
+    # Compute correlation between surprisal and latent mean
+    # Normalize
+    s_norm = (s_flat - s_flat.mean()) / (s_flat.std() + 1e-8)
+    z_norm = (z_flat_mean - z_flat_mean.mean()) / (z_flat_mean.std() + 1e-8)
+    
+    # Pearson correlation
+    correlation = (s_norm * z_norm).mean()
+    
+    # MI approximation: MI ≈ -0.5 * log(1 - ρ²)
+    # Clamp correlation to avoid log(0)
+    correlation = torch.clamp(correlation, -0.999, 0.999)
+    mi = -0.5 * torch.log(1 - correlation ** 2 + 1e-8)
+    
+    # Ensure non-negative
+    mi = torch.clamp(mi, min=0.0)
     
     return mi
 
