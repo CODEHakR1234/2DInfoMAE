@@ -156,12 +156,23 @@ class Trainer:
         
         pbar = tqdm(val_loader, desc="Validation")
         
-        for images, _ in pbar:
+        for batch_data in pbar:
+            # ✅ FIXED: Handle IndexedDataset (image_ids, images, labels)
+            if len(batch_data) == 3:
+                # (image_ids, images, labels) - from IndexedDataset
+                image_ids, images, _ = batch_data
+                image_ids = image_ids.to(self.device)
+            else:
+                # (images, labels) - from regular dataset
+                images, _ = batch_data
+                image_ids = None
+            
             images = images.to(self.device)
             
             # Forward pass
             loss, pred, mask, surprisal, latent = self.model(
                 images,
+                image_ids=image_ids,  # Pass image_ids for epoch cache
                 mask_ratio=self.config.model.mask_ratio,
                 lambda_weight=self.config.model.lambda_end,  # Use final lambda for eval
                 alpha=self.config.model.masking_alpha,

@@ -472,6 +472,8 @@ def main():
                        help='Batch size')
     parser.add_argument('--lr', type=float, default=None,
                        help='Learning rate')
+    parser.add_argument('--num_workers', type=int, default=None,
+                       help='Number of dataloader workers (reduce if shared memory issues)')
     parser.add_argument('--seed', type=int, default=42,
                        help='Random seed')
     parser.add_argument('--no_wandb', action='store_true',
@@ -499,6 +501,8 @@ def main():
         config.training.batch_size = args.batch_size
     if args.lr:
         config.training.lr = args.lr
+    if args.num_workers is not None:
+        config.training.num_workers = args.num_workers
     if args.seed:
         config.seed = args.seed
     if args.no_wandb:

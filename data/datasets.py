@@ -166,12 +166,19 @@ def build_dataloader(dataset: Dataset, batch_size: int, num_workers: int = 8,
     Args:
         dataset: PyTorch dataset
         batch_size: batch size
-        num_workers: number of workers
+        num_workers: number of workers (default 8, reduce if shared memory issues)
         shuffle: whether to shuffle
         drop_last: whether to drop last incomplete batch
         pin_memory: whether to pin memory
         return_index: whether to return dataset index (for epoch caching)
     """
+    
+    # ✅ FIXED: Reduce num_workers if too high to avoid shared memory issues
+    # Shared memory default is usually 64MB per worker, which can be insufficient
+    # Auto-adjust: reduce workers if batch_size is large
+    if num_workers > 4 and batch_size > 128:
+        # Large batches + many workers = high memory usage
+        num_workers = min(num_workers, 4)
     
     # Wrap dataset to return index if needed
     if return_index:
@@ -182,8 +189,9 @@ def build_dataloader(dataset: Dataset, batch_size: int, num_workers: int = 8,
         batch_size=batch_size,
         shuffle=shuffle,
         num_workers=num_workers,
-        pin_memory=pin_memory,
+        pin_memory=pin_memory if torch.cuda.is_available() else False,
         drop_last=drop_last,
+        persistent_workers=True if num_workers > 0 else False,  # Reuse workers to reduce overhead
     )
     
     return loader
