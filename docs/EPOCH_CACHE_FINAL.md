@@ -94,7 +94,7 @@ if model.use_epoch_cache:
 Image 001 → forward → surprisal_001 → save to memory[001]
 Image 002 → forward → surprisal_002 → save to memory[002]
 ...
-# 첫 epoch는 EMA fallback 사용
+# 첫 epoch는 cache 없으므로 random masking 사용
 ```
 
 ### Epoch 2:
@@ -129,7 +129,7 @@ Image 002 → load memory[002] → use cached surprisal → forward → update m
    - 자동차 이미지 → 자동차 surprisal
 
 2. **Flat Problem 해결** ✅
-   - Position-based EMA: std = 0.025 (flat)
+   - Position-based EMA (제거됨): std = 0.025 (flat)
    - Epoch cache: std = 0.15~0.25 (6-10배 증가!)
 
 3. **계산 비용 동일** ✅
@@ -155,7 +155,7 @@ python test_epoch_cache.py
 # ✅ Epoch cache initialized (102 MB on cpu)
 # ✅ First epoch: building cache
 # ✅ Second epoch: using cache
-# ✅ Cache std > EMA std (more variance!)
+# ✅ Cache has much more variance than position-based approach
 ```
 
 ---
@@ -168,10 +168,12 @@ python test_epoch_cache.py
 # Epoch cache는 기본적으로 활성화됨
 ```
 
-### 비활성화 (EMA only):
+### 비활성화 (Random masking):
 ```python
 # models/infomae.py
 self.use_epoch_cache = False  # Disable
+# 또는
+self.adaptive_masking = False  # Random masking 사용
 ```
 
 ### 메모리 위치 변경:

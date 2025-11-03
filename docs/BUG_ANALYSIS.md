@@ -286,33 +286,28 @@ def adaptive_masking_strategy(self, x, mask_ratio, alpha=3.0, gamma=1.0):
 
 ---
 
-### 7. **Surprisal EMA 업데이트 문제** ✅ FIXED
+### 7. **Surprisal EMA 제거** ✅ FIXED
 
-**위치**: `models/infomae.py`, line 350-353
+**위치**: `models/infomae.py`
 
-**문제:**
+**변경사항:**
+- Position-based EMA (flat map 문제) 제거됨
+- Epoch-level cache (image-specific)로 대체됨
+
+**현재 구현:**
 ```python
-batch_surprisal = surprisal.mean(dim=0)  # [L]
-self.surprisal_ema = (self.surprisal_momentum * self.surprisal_ema + 
-                      (1 - self.surprisal_momentum) * batch_surprisal)
+# Surprisal은 epoch-level cache에 저장
+# 각 이미지의 surprisal이 독립적으로 저장되고 사용됨
+# forward() 메서드에서 epoch cache에 저장
+if self.training and image_ids is not None:
+    self.surprisal_memory[image_ids_cpu] = surprisal.detach().cpu()
+    self.surprisal_initialized[image_ids_cpu] = True
 ```
 
-**이슈:**
-- `surprisal`은 `[B, L]` 형태
-- `mask`가 적용된 패치만 의미 있는 loss를 가짐
-- 마스크되지 않은 패치의 loss는 0이므로 평균이 왜곡됨
-
-**개선안:**
-```python
-if self.training:
-    # 마스크된 패치만 고려
-    masked_surprisal = surprisal * mask  # 마스크된 부분만
-    num_masked = mask.sum(dim=0).clamp(min=1)  # 각 패치별 마스크 횟수
-    batch_surprisal = masked_surprisal.sum(dim=0) / num_masked
-    
-    self.surprisal_ema = (self.surprisal_momentum * self.surprisal_ema + 
-                          (1 - self.surprisal_momentum) * batch_surprisal)
-```
+**결과:**
+- ✅ 이미지별 정확한 surprisal
+- ✅ Content-based adaptive masking
+- ✅ Flat map 문제 해결
 
 ---
 

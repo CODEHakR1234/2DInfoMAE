@@ -16,11 +16,8 @@ def forward_loss(self, imgs, pred, mask):
     with torch.no_grad():
         surprisal = loss.detach()  # masked + unmasked 모두!
         
-        # EMA는 masked만 업데이트
-        if self.training:
-            masked_surprisal = surprisal * mask
-            batch_surprisal = masked_surprisal.sum(dim=0) / num_masked
-            self.surprisal_ema = ...
+        # Note: EMA has been removed in favor of epoch-level cache
+        # Surprisal is now saved to epoch cache in forward() method
     
     # Loss는 masked만
     loss = (loss * mask).sum() / mask.sum()
@@ -105,12 +102,8 @@ def forward_loss(self, imgs, pred, mask):
         # Zero out unmasked patches!
         surprisal = loss.detach() * mask  # [N, L] - masked only!
         
-        # EMA 업데이트 (동일)
-        if self.training:
-            num_masked = mask.sum(dim=0).clamp(min=1)
-            batch_surprisal = surprisal.sum(dim=0) / num_masked
-            self.surprisal_ema = (self.surprisal_momentum * self.surprisal_ema + 
-                                  (1 - self.surprisal_momentum) * batch_surprisal)
+        # Note: Surprisal is saved to epoch-level cache in forward() method
+        # EMA has been removed in favor of epoch cache (image-specific, content-based)
     
     # Loss (동일)
     loss = (loss * mask).sum() / mask.sum()
@@ -139,23 +132,16 @@ surprisal = loss.detach() * mask  # [N, L] - masked only!
 
 ## 🎯 영향 분석
 
-### 1. **EMA 업데이트**
+### 1. **Surprisal 저장 (EMA 제거됨)**
 
-**이전:**
+**현재 (EMA 제거됨):**
 ```python
-masked_surprisal = surprisal * mask  # 한 번 더 masking
-batch_surprisal = masked_surprisal.sum(dim=0) / num_masked
-# → EMA에는 영향 없음! ✅
+# Surprisal은 epoch-level cache에 저장됨
+# 각 이미지의 surprisal이 독립적으로 저장되고 사용됨
+# forward() 메서드에서 cache에 저장
 ```
 
-**이후:**
-```python
-batch_surprisal = surprisal.sum(dim=0) / num_masked
-# surprisal이 이미 masked되어 있음
-# → 결과 동일! ✅
-```
-
-**결론:** EMA 업데이트는 변경 전후 동일 ✅
+**결론:** Epoch cache 사용으로 이미지별 정확한 surprisal 관리 ✅
 
 ---
 

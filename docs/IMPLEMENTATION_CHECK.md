@@ -70,27 +70,32 @@ class InfoMAELoss(nn.Module):
 
 ---
 
-### ✅ Surprisal Tracking (EMA)
+### ✅ Surprisal Tracking (Epoch Cache)
 **제안서 요구사항:**
 ```
 Surprisal Map S = |x - x̂|²
 ```
 
-**구현 위치:** `models/infomae.py` (117-118줄, 355-362줄)
+**구현 위치:** `models/infomae.py`
 ```python
-# 초기화
-self.register_buffer('surprisal_ema', torch.ones(self.num_patches))
-self.surprisal_momentum = 0.9
+# Epoch-level cache (image-specific)
+self.use_epoch_cache = True
+self.surprisal_memory = None  # [dataset_size, num_patches]
 
-# 업데이트
+# Surprisal 계산 및 저장
 def forward_loss(self, imgs, pred, mask):
-    surprisal = loss.detach()
+    surprisal = loss.detach() * mask  # Masked patches only
+    # Saved to epoch cache in forward() method
+
+def forward(self, imgs, ..., image_ids=None):
+    # Get from cache if available
+    if image_ids is not None and cache_available:
+        surprisal_override = self.surprisal_memory[image_ids]
+    # Save to cache
     if self.training:
-        batch_surprisal = surprisal.mean(dim=0)
-        self.surprisal_ema = (self.surprisal_momentum * self.surprisal_ema + 
-                              (1 - self.surprisal_momentum) * batch_surprisal)
+        self.surprisal_memory[image_ids] = surprisal.detach().cpu()
 ```
-**상태:** ✅ **완전 구현**
+**상태:** ✅ **완전 구현** (EMA 제거, Epoch Cache 사용)
 
 ---
 

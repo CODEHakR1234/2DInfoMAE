@@ -145,11 +145,8 @@ class InfoMAE(nn.Module):
         self.decoder_norm = norm_layer(decoder_embed_dim)
         self.decoder_pred = nn.Linear(decoder_embed_dim, patch_size**2 * in_chans, bias=True)
         
-        # Surprisal tracking (exponential moving average)
-        self.register_buffer('surprisal_ema', torch.ones(self.num_patches))
-        self.surprisal_momentum = 0.9
-        
         # ✅ EPOCH-LEVEL SURPRISAL CACHE for image-specific adaptive masking
+        # Note: EMA (position-based) has been removed in favor of epoch cache (content-based)
         # Instead of using position-based EMA (which becomes flat across dataset),
         # we cache the actual surprisal from previous epoch for each image.
         # This provides true image-specific, content-based surprisal.
@@ -165,20 +162,53 @@ class InfoMAE(nn.Module):
         
         self.initialize_weights()
         
-    def initialize_epoch_cache(self, dataset_size: int, device: str = 'cpu'):
+    def initialize_epoch_cache(self, dataset_size: int, device: str = 'cpu', use_half_precision: bool = False):
         """
         Initialize epoch-level surprisal cache
         
         Args:
             dataset_size: Number of images in the dataset
             device: 'cpu' or 'cuda' - CPU recommended to save GPU memory
+            use_half_precision: Use float16 instead of float32 (2x memory saving)
+                                Default False to match standard research practices (float32)
+        
+        Memory usage:
+            - Float32: dataset_size × 196 × 4 bytes
+            - Float16: dataset_size × 196 × 2 bytes
+            Examples:
+                - CIFAR-100 (50k): 39 MB (float32) / 20 MB (float16)
+                - ImageNet-100 (130k): 102 MB (float32) / 51 MB (float16)
+                - Full ImageNet-1K (1.2M): 1 GB (float32) / 500 MB (float16)
+        
+        Note: Float32 is the default to match standard research practices.
+              Use float16 only if memory is constrained (e.g., Full ImageNet-1K).
         """
+        dtype = torch.float16 if use_half_precision else torch.float32
+        bytes_per_element = 2 if use_half_precision else 4
+        memory_mb = dataset_size * self.num_patches * bytes_per_element / 1e6
+        
         print(f"Initializing epoch cache for {dataset_size} images...")
-        print(f"Memory: {dataset_size * self.num_patches * 4 / 1e6:.2f} MB on {device}")
+        print(f"  Memory: {memory_mb:.2f} MB on {device} ({dtype})")
+        
+        # Inform about memory usage (note: CPU memory is usually plentiful)
+        memory_gb = memory_mb / 1000
+        
+        # Only warn for very large caches (> 5GB)
+        # Typical systems have 16-32GB+ RAM, so even 1-2GB cache is fine
+        if memory_gb > 5.0:
+            print(f"  ⚠️  WARNING: Very large cache size ({memory_gb:.2f} GB)")
+            print(f"     If you encounter memory issues, consider:")
+            print(f"     - Use use_half_precision=True (saves 50% memory, {memory_gb/2:.2f} GB)")
+            print(f"     - Or disable cache (set use_epoch_cache=False)")
+        elif memory_gb > 2.0:
+            print(f"  ℹ️  Info: Large cache size ({memory_gb:.2f} GB)")
+            print(f"     This is typically fine on modern systems (>8GB RAM)")
+            if not use_half_precision and memory_gb > 1.0:
+                print(f"     Optional: use_half_precision=True to reduce to ~{memory_gb/2:.2f} GB")
         
         self.surprisal_memory = torch.zeros(
             dataset_size, self.num_patches,
-            dtype=torch.float32,
+            dtype=dtype,
             device=device
         )
         self.surprisal_initialized = torch.zeros(
@@ -233,22 +263,25 @@ class InfoMAE(nn.Module):
         return imgs
     
     def random_masking(self, x, mask_ratio):
-        """Random masking: uniform random"""
+        """
+        Random masking: uniform random
+        Returns: x_masked, mask, ids_restore, ids_keep
+        """
         N, L, D = x.shape
         len_keep = int(L * (1 - mask_ratio))
         
         noise = torch.rand(N, L, device=x.device)
-        ids_shuffle = torch.argsort(noise, dim=1)
-        ids_restore = torch.argsort(ids_shuffle, dim=1)
+        ids_shuffle = torch.argsort(noise, dim=1)  # [N, L] - shuffled indices
+        ids_restore = torch.argsort(ids_shuffle, dim=1)  # [N, L] - inverse permutation
         
-        ids_keep = ids_shuffle[:, :len_keep]
+        ids_keep = ids_shuffle[:, :len_keep]  # [N, len_keep] - kept patch indices
         x_masked = torch.gather(x, dim=1, index=ids_keep.unsqueeze(-1).repeat(1, 1, D))
         
         mask = torch.ones([N, L], device=x.device)
         mask[:, :len_keep] = 0
         mask = torch.gather(mask, dim=1, index=ids_restore)
         
-        return x_masked, mask, ids_restore
+        return x_masked, mask, ids_restore, ids_keep
     
     def adaptive_masking_strategy(self, x, mask_ratio, alpha=3.0, gamma=1.0, surprisal_override=None):
         """
@@ -266,14 +299,18 @@ class InfoMAE(nn.Module):
         N, L, D = x.shape
         
         # ✅ Use epoch-cached surprisal if available (image-specific, content-based)
-        # Otherwise fallback to EMA (position-based, less accurate)
+        # If not available (first epoch or cache disabled), return None to use random masking
         if surprisal_override is not None and self.use_epoch_cache:
-            surprisal = surprisal_override  # [B, L] - from previous epoch
+            surprisal = surprisal_override  # [B, L] - from previous epoch (masked patches only, unmasked = 0)
         else:
-            # Fallback to EMA
-            surprisal = self.surprisal_ema.unsqueeze(0).expand(N, -1)  # [B, L]
+            # No cache available - return None to fallback to random masking
+            # This happens in first epoch when cache is not yet built
+            return None
         
         # Compute masking probabilities
+        # p_mask = sigmoid(alpha - gamma * surprisal)
+        # - surprisal > 0 (high): patch was difficult to reconstruct → low mask prob → learn more often
+        # - surprisal = 0: patch was NOT masked (not yet learned) → high mask prob → should mask to learn
         mask_probs = torch.sigmoid(alpha - gamma * surprisal)
         
         # Sample masks
@@ -281,35 +318,102 @@ class InfoMAE(nn.Module):
         
         # Ensure we mask approximately mask_ratio tokens
         target_masked = int(L * mask_ratio)
-        current_masked = mask.sum(dim=1, keepdim=True)
-        adjustment = target_masked - current_masked
+        current_masked = mask.sum(dim=1, keepdim=True)  # [N, 1] - long tensor
+        adjustment = (target_masked - current_masked).squeeze(1)  # [N] - long tensor
         
-        # Adjust mask to match target ratio
+        # ✅ FIXED: Adjust mask to match target ratio (type-safe: ensure int casting)
         for i in range(N):
-            if adjustment[i] > 0:
+            adj = int(round(adjustment[i].item()))  # Convert to Python int with rounding
+            if adj > 0:
                 # Need to mask more
                 unmasked_idx = (mask[i] == 0).nonzero(as_tuple=True)[0]
                 if len(unmasked_idx) > 0:
+                    n_to_mask = min(adj, len(unmasked_idx))
+                    n_to_mask = int(n_to_mask)  # Ensure int for indexing
                     perm = torch.randperm(len(unmasked_idx), device=x.device)
-                    to_mask = unmasked_idx[perm[:int(adjustment[i])]]
+                    to_mask = unmasked_idx[perm[:n_to_mask]]
                     mask[i, to_mask] = 1
-            elif adjustment[i] < 0:
+            elif adj < 0:
                 # Need to unmask some
                 masked_idx = (mask[i] == 1).nonzero(as_tuple=True)[0]
                 if len(masked_idx) > 0:
+                    n_to_unmask = min(-adj, len(masked_idx))
+                    n_to_unmask = int(n_to_unmask)  # Ensure int for indexing
                     perm = torch.randperm(len(masked_idx), device=x.device)
-                    to_unmask = masked_idx[perm[:int(-adjustment[i])]]
+                    to_unmask = masked_idx[perm[:n_to_unmask]]
                     mask[i, to_unmask] = 0
         
-        # Get kept indices
-        ids_keep = (mask == 0).nonzero(as_tuple=False)
-        ids_keep = ids_keep[:, 1].reshape(N, -1)
-        x_masked = torch.gather(x, dim=1, index=ids_keep.unsqueeze(-1).repeat(1, 1, D))
+        # ✅ FIXED: Create ids_keep and ids_restore per sample with proper inverse permutation
+        # Sample-by-sample: ids_shuffle = [keep_idx..., mask_idx...]
+        # ids_restore[ids_shuffle[j]] = j (inverse permutation)
+        ids_keep_list = []
+        ids_restore_list = []
         
-        # Create restore indices
-        ids_restore = torch.argsort(torch.argsort(mask, dim=1), dim=1)
+        for i in range(N):
+            # Get kept and masked indices for this sample
+            keep_idx = (mask[i] == 0).nonzero(as_tuple=True)[0]  # [N_keep]
+            mask_idx = (mask[i] == 1).nonzero(as_tuple=True)[0]  # [N_masked]
+            
+            # ✅ FIXED: Create ids_shuffle and ids_restore matching random_masking logic
+            # ids_shuffle: [keep_idx..., mask_idx...] - concatenated order
+            # This represents the shuffled sequence: [x[keep_idx[0]], ..., x[keep_idx[N_keep-1]], mask, ..., mask]
+            ids_shuffle = torch.cat([keep_idx, mask_idx], dim=0)  # [L]
+            
+            # ids_restore: inverse permutation of ids_shuffle
+            # ids_restore[j] = "position in ids_shuffle where original patch j appears"
+            # This is equivalent to: ids_restore = torch.argsort(torch.argsort(ids_shuffle))
+            # But we compute it directly for clarity:
+            ids_restore = torch.zeros(L, dtype=torch.long, device=x.device)
+            for pos, orig_idx in enumerate(ids_shuffle):
+                ids_restore[orig_idx] = pos
+            
+            ids_keep_list.append(keep_idx)
+            ids_restore_list.append(ids_restore)
         
-        return x_masked, mask, ids_restore
+        # Stack ids_restore: [N, L]
+        ids_restore = torch.stack(ids_restore_list, dim=0)
+        
+        # ✅ FIXED: Handle variable-length ids_keep - use actual lengths per sample
+        # Note: All samples should have similar N_keep due to mask_ratio adjustment,
+        # but we handle it properly to avoid padding issues
+        max_keep = max(len(k) for k in ids_keep_list) if ids_keep_list else 0
+        
+        # Extract kept patches per sample (avoid padding issues)
+        x_masked_list = []
+        ids_keep_padded = torch.zeros(N, max_keep, dtype=torch.long, device=x.device) if max_keep > 0 else torch.zeros(N, 0, dtype=torch.long, device=x.device)
+        
+        for i, k in enumerate(ids_keep_list):
+            # Extract kept patches for this sample using actual indices
+            x_masked_list.append(torch.index_select(x[i], dim=0, index=k))  # [len(k), D]
+            # Store ids_keep for later use (padded to max_keep)
+            if len(k) > 0:
+                ids_keep_padded[i, :len(k)] = k
+        
+        # ✅ FIXED: Stack x_masked - ensure consistent length across samples
+        # After mask adjustment, all samples should have same N_keep
+        if len(x_masked_list) > 0:
+            lengths = [t.shape[0] for t in x_masked_list]
+            # Ensure all samples have the same N_keep (should be after adjustment)
+            if len(set(lengths)) == 1:
+                # All same length - can stack directly
+                x_masked = torch.stack(x_masked_list, dim=0)  # [N, N_keep, D]
+                # ids_keep: remove padding, keep only actual N_keep
+                actual_N_keep = lengths[0]
+                ids_keep = ids_keep_padded[:, :actual_N_keep]  # [N, actual_N_keep]
+            else:
+                # Variable length detected (shouldn't happen after adjustment)
+                # Pad to max length for consistency
+                max_len = max(lengths)
+                x_masked = torch.zeros(N, max_len, D, device=x.device, dtype=x.dtype)
+                for i, t in enumerate(x_masked_list):
+                    x_masked[i, :t.shape[0]] = t
+                # Use padded ids_keep (already padded to max_keep which should equal max_len)
+                ids_keep = ids_keep_padded[:, :max_len]  # [N, max_len]
+        else:
+            x_masked = torch.zeros(N, 0, D, device=x.device, dtype=x.dtype)
+            ids_keep = ids_keep_padded
+        
+        return x_masked, mask, ids_restore, ids_keep
     
     def forward_encoder(self, x, mask_ratio, lambda_weight=0.0, alpha=3.0, gamma=1.0, surprisal_override=None):
         """
@@ -328,23 +432,92 @@ class InfoMAE(nn.Module):
         x = x + self.pos_embed[:, 1:, :]
         
         # Masking
+        ids_keep = None  # Will be set by masking strategy
         if self.adaptive_masking and self.training:
             # ✅ Pass cached surprisal to adaptive masking
-            x, mask, ids_restore = self.adaptive_masking_strategy(
+            mask_result = self.adaptive_masking_strategy(
                 x, mask_ratio, alpha, gamma, surprisal_override=surprisal_override
             )
+            if mask_result is not None:
+                x, mask, ids_restore, ids_keep = mask_result
+            else:
+                # Fallback to random masking if no cache available (first epoch)
+                x, mask, ids_restore, ids_keep = self.random_masking(x, mask_ratio)
         else:
-            x, mask, ids_restore = self.random_masking(x, mask_ratio)
+            x, mask, ids_restore, ids_keep = self.random_masking(x, mask_ratio)
         
         # Prepare surprisal bias BEFORE adding cls token
+        # ✅ Patch-wise surprisal bias: each patch gets its own surprisal value
         surprisal_bias = None
         if self.use_surprisal_attention and lambda_weight > 0:
             B = x.shape[0]
             N_keep = x.shape[1]  # Number of kept patches (before cls token)
-            # Use mean surprisal for simplicity
-            mean_surprisal = self.surprisal_ema.mean()
-            # Create bias for cls (1) + kept patches (N_keep)
-            surprisal_bias = torch.ones(B, 1 + N_keep, device=x.device) * mean_surprisal
+            
+            # ✅ Use cached surprisal per patch (image-specific, patch-specific, content-based)
+            # Each patch gets its own surprisal value independently
+            if surprisal_override is not None:
+                # surprisal_override: [B, L] - each image has its own surprisal per patch
+                # ✅ FIXED: Use ids_keep directly from masking strategy to ensure token order consistency
+                # ids_keep: [B, N_keep] - indices of kept patches in original order
+                # This ensures the surprisal mapping matches the actual kept patch order used in encoder
+                # ✅ FIXED: Ensure ids_keep length matches actual N_keep
+                # ids_keep should be [B, N_keep] after mask adjustment, but verify consistency
+                actual_ids_keep_len = ids_keep.shape[1] if ids_keep.dim() > 1 else N_keep
+                if actual_ids_keep_len != N_keep:
+                    # Length mismatch - trim or handle appropriately
+                    # This should not happen after mask adjustment, but handle gracefully
+                    actual_N_keep = min(actual_ids_keep_len, N_keep)
+                    ids_keep_trimmed = ids_keep[:, :actual_N_keep]
+                    N_keep_use = actual_N_keep
+                else:
+                    ids_keep_trimmed = ids_keep
+                    N_keep_use = N_keep
+                
+                kept_patch_surprisal = []
+                for b in range(B):
+                    # Use ids_keep[b] directly (ensures correct ordering with encoder tokens)
+                    kept_idx = ids_keep_trimmed[b, :N_keep_use]  # [N_keep_use] - indices of kept patches
+                    # Extract surprisal for kept patches using ids_keep
+                    patch_surprisal = surprisal_override[b, kept_idx]  # [N_keep_use]
+                    kept_patch_surprisal.append(patch_surprisal)
+                
+                # Stack: [B, N_keep_use] - each patch has its own surprisal value
+                kept_patch_surprisal = torch.stack(kept_patch_surprisal, dim=0)  # [B, N_keep_use]
+                
+                # Ensure dimension matches x.shape[1] (actual N_keep)
+                if kept_patch_surprisal.shape[1] != N_keep:
+                    # Trim or pad to match actual encoder input length
+                    if kept_patch_surprisal.shape[1] < N_keep:
+                        # Pad with zeros (shouldn't happen, but handle it)
+                        padding = torch.zeros(B, N_keep - kept_patch_surprisal.shape[1], 
+                                            device=kept_patch_surprisal.device)
+                        kept_patch_surprisal = torch.cat([kept_patch_surprisal, padding], dim=1)
+                    else:
+                        # Trim to match (shouldn't happen either)
+                        kept_patch_surprisal = kept_patch_surprisal[:, :N_keep]
+                
+                # ✅ FIXED: Normalize surprisal to prevent scale issues and softmax saturation
+                # Z-score normalization per batch + tanh for bounded range [-1, 1]
+                # This prevents unbounded values that could saturate softmax
+                batch_mean = kept_patch_surprisal.mean(dim=1, keepdim=True)  # [B, 1]
+                batch_std = kept_patch_surprisal.std(dim=1, keepdim=True) + 1e-8  # [B, 1]
+                kept_patch_surprisal = (kept_patch_surprisal - batch_mean) / batch_std  # Z-score
+                kept_patch_surprisal = torch.tanh(kept_patch_surprisal)  # Bounded to [-1, 1]
+                
+                # For cls token: cls token is not a real patch, so it doesn't have its own surprisal.
+                # We use zero bias for cls token (no surprisal-based attention modification).
+                # Only real patches get patch-specific surprisal bias.
+                cls_bias = torch.zeros(B, 1, device=x.device)  # [B, 1] - no bias for cls token
+                
+                # Concatenate: cls token (zero bias) + kept patches surprisal (patch-wise!)
+                surprisal_bias = torch.cat([cls_bias, kept_patch_surprisal], dim=1)  # [B, 1 + N_keep]
+                # Attention formula: A_ij = softmax(Q_i K_j^T / sqrt(d) + λ * S_j)
+                # - When attending to cls token (j=0): uses zero bias (no surprisal modification)
+                # - When attending to patch k (j=k): uses patch_k_bias (patch-specific surprisal)
+                # This makes sense: only real patches have reconstruction difficulty (surprisal)
+            else:
+                # First epoch: no cache available, use zero (no bias)
+                surprisal_bias = torch.zeros(B, 1 + N_keep, device=x.device)
         
         # Add cls token
         cls_token = self.cls_token + self.pos_embed[:, :1, :]
@@ -403,23 +576,24 @@ class InfoMAE(nn.Module):
         loss = loss.mean(dim=-1)  # [N, L], mean loss per patch
         
         # Compute surprisal (reconstruction error) per patch
-        # ✅ IMPORTANT: Surprisal is only meaningful for masked patches!
-        # Unmasked patches have low reconstruction error (original info available)
-        # but they don't contribute to the loss, so their "surprisal" is meaningless.
+        # ✅ IMPORTANT: MAE only learns to reconstruct MASKED patches!
+        # Unmasked patches have original information in encoder, so their
+        # reconstruction error is NOT learned and cannot be trusted.
+        # Therefore, we only store surprisal for masked patches (where learning happened).
+        #
+        # For adaptive masking in next epoch:
+        # - Surprisal > 0: This patch was masked and learned → difficult to reconstruct
+        #                  → low mask prob (learn more often)
+        # - Surprisal = 0: This patch was NOT masked → not yet learned
+        #                  → high mask prob (should be masked to learn)
         with torch.no_grad():
-            # Only compute surprisal for masked patches (zero out unmasked)
-            surprisal = loss.detach() * mask  # [N, L] - masked only!
-            
-            # Update EMA (only for masked patches)
-            if self.training:
-                num_masked = mask.sum(dim=0).clamp(min=1)  # Avoid division by zero
-                batch_surprisal = surprisal.sum(dim=0) / num_masked
-                self.surprisal_ema = (self.surprisal_momentum * self.surprisal_ema + 
-                                      (1 - self.surprisal_momentum) * batch_surprisal)
+            # Only store surprisal for masked patches (where learning occurred)
+            surprisal = loss.detach() * mask  # [N, L] - masked patches only!
+            # Note: Surprisal is saved to epoch cache in forward() method
         
         # Loss only on masked patches
         loss = (loss * mask).sum() / mask.sum()
-        return loss, surprisal  # surprisal: [N, L] with unmasked = 0
+        return loss, surprisal  # surprisal: [N, L] - masked patches only (unmasked = 0)
     
     def forward(self, imgs, mask_ratio=0.75, lambda_weight=0.0, alpha=3.0, gamma=1.0, 
                 image_ids=None):
@@ -438,19 +612,27 @@ class InfoMAE(nn.Module):
             loss: reconstruction loss
             pred: [N, L, p*p*3] predictions
             mask: [N, L] mask (0=keep, 1=remove)
-            surprisal: [N, L] surprisal (reconstruction error, masked patches only)
+            surprisal: [N, L] surprisal (reconstruction error for masked patches only, unmasked = 0)
             latent: [N, N_keep+1, D] latent representations
         """
         # ✅ Get cached surprisal from epoch memory if available
+        # Handle partial initialization: use cache for initialized images, zeros for others
         surprisal_override = None
         if image_ids is not None and self.use_epoch_cache and self.surprisal_memory is not None:
             # Move image_ids to same device as memory (usually CPU) for indexing
             image_ids_cpu = image_ids.cpu() if image_ids.device != self.surprisal_memory.device else image_ids
             
-            # Check if all images have cached surprisal
-            if self.surprisal_initialized[image_ids_cpu].all():
-                # Get from memory (CPU or GPU)
+            # Check which images are initialized
+            initialized = self.surprisal_initialized[image_ids_cpu]  # [B] bool
+            
+            if initialized.any():  # At least one image is initialized
+                # Get from memory (initialized images have data, uninitialized have zeros)
                 surprisal_override = self.surprisal_memory[image_ids_cpu].to(imgs.device)
+                # Convert to float32 if needed (for computation)
+                if surprisal_override.dtype == torch.float16:
+                    surprisal_override = surprisal_override.float()
+                # Note: Uninitialized images will have zeros (all patches surprisal = 0)
+                # This is correct: surprisal = 0 means "not yet learned" → high mask prob (random-like)
         
         # Forward pass
         latent, mask, ids_restore = self.forward_encoder(
@@ -465,6 +647,13 @@ class InfoMAE(nn.Module):
             # Move to same device as memory (usually CPU) for indexing
             image_ids_cpu = image_ids.cpu() if image_ids.device != self.surprisal_memory.device else image_ids
             surprisal_cpu = surprisal.detach().to(self.surprisal_memory.device)
+            
+            # Convert to cache dtype (float16 if cache uses half precision)
+            if self.surprisal_memory.dtype == torch.float16:
+                surprisal_cpu = surprisal_cpu.half()
+            else:
+                surprisal_cpu = surprisal_cpu.float()
+            
             self.surprisal_memory[image_ids_cpu] = surprisal_cpu
             self.surprisal_initialized[image_ids_cpu] = True
         

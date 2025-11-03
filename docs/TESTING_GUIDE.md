@@ -133,18 +133,19 @@ print(f"✅ Stage 2 OK - Loss: {loss.item():.4f}")
 ```python
 model = InfoMAE(use_surprisal_attention=True).to(device).train()
 
-print("\nTesting Surprisal EMA Update")
-print(f"Initial surprisal: {model.surprisal_ema.mean():.4f}")
-
+print("\nTesting Epoch Cache Update")
+model.initialize_epoch_cache(100, device='cpu')
 x = torch.randn(16, 3, 224, 224).to(device)
+image_ids = torch.arange(16)
 
 # 여러 번 forward
 for i in range(10):
-    loss, _, _, _, _ = model(x, mask_ratio=0.75)
+    loss, _, _, surprisal, _ = model(x, mask_ratio=0.75, image_ids=image_ids)
     if i % 3 == 0:
-        print(f"Step {i}: surprisal = {model.surprisal_ema.mean():.4f}")
+        cached = model.surprisal_memory[image_ids.cpu()]
+        print(f"Step {i}: cached surprisal mean = {cached.mean():.4f}")
 
-print(f"\nFinal surprisal: {model.surprisal_ema.mean():.4f}")
+print(f"\nFinal cached surprisal: {model.surprisal_memory[image_ids.cpu()].mean():.4f}")
 print("✅ Surprisal is updating correctly")
 ```
 
@@ -285,20 +286,26 @@ except RuntimeError as e:
     else:
         raise
 
-# 버그 2: Surprisal EMA 올바른 업데이트
-print("\n=== Bug 2: Surprisal EMA Update Test ===")
+# 테스트 2: Epoch Cache 동작 확인
+print("\n=== Test 2: Epoch Cache Update Test ===")
 model = InfoMAE().to(device).train()
-surprisal_before = model.surprisal_ema.clone()
 
-x = torch.randn(8, 3, 224, 224).to(device)
-for _ in range(5):
-    loss, _, _, _, _ = model(x)
+# Initialize cache
+dataset_size = 100
+model.initialize_epoch_cache(dataset_size, device='cpu')
 
-surprisal_after = model.surprisal_ema
-if not torch.allclose(surprisal_before, surprisal_after):
-    print("✅ Surprisal EMA is updating - BUG FIXED!")
+image_ids = torch.tensor([0, 1, 2, 3])
+x = torch.randn(4, 3, 224, 224).to(device)
+
+# Forward pass
+loss, _, _, surprisal, _ = model(x, image_ids=image_ids)
+
+# Check if cache was updated
+if model.surprisal_initialized[image_ids.cpu()].all():
+    print("✅ Epoch cache is updating correctly!")
+    print(f"   Cached surprisal shape: {model.surprisal_memory[image_ids.cpu()].shape}")
 else:
-    print("❌ Surprisal EMA not updating - BUG STILL EXISTS!")
+    print("❌ Epoch cache not updating!")
 ```
 
 ---
