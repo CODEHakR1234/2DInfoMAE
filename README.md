@@ -50,6 +50,29 @@ InfoMAE extends the Masked Autoencoder (MAE) with three key innovations:
 
 ---
 
+## 📚 Documentation
+
+### 🚀 Getting Started
+- **[Quick Start](QUICKSTART.md)** - Get running in 5 minutes ⚡
+- **[Setup Guide](SETUP_GUIDE.md)** - Detailed installation instructions
+- **[Usage Guide](USAGE.md)** - Complete usage manual
+
+### 🔬 Research & Experiments
+- **[Experiments](EXPERIMENTS.md)** - Experiment designs, settings, and expected results
+- **[Implementation Check](docs/IMPLEMENTATION_CHECK.md)** - Verify implementation completeness
+
+### 👥 Development
+- **[Contributing](CONTRIBUTING.md)** - How to contribute to the project
+- **[Bug Analysis](docs/BUG_ANALYSIS.md)** - Known issues and fixes
+- **[Testing Guide](docs/TESTING_GUIDE.md)** - How to test the code
+- **[Changelog](CHANGELOG.md)** - Version history
+
+### 📖 Additional Resources
+- **[GitHub Setup Guide](docs/GITHUB_SETUP.md)** - How to set up a similar project
+- **[GitHub Files Explained](docs/GITHUB_FILES_EXPLAINED.md)** - Understanding GitHub special files
+
+---
+
 ## 📦 Installation
 
 ### Requirements
