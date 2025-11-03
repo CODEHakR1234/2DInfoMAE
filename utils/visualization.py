@@ -276,13 +276,28 @@ def plot_training_curves(
     train_losses: List[float],
     val_losses: List[float],
     save_path: Optional[str] = None,
+    val_epochs: Optional[List[int]] = None,
 ):
-    """Plot training and validation loss curves"""
+    """Plot training and validation loss curves
+    
+    Args:
+        train_losses: Loss at each training epoch
+        val_losses: Loss at validation epochs
+        save_path: Path to save the plot
+        val_epochs: Epoch numbers where validation was performed
+    """
     fig, ax = plt.subplots(1, 1, figsize=(10, 6))
     
-    epochs = range(1, len(train_losses) + 1)
-    ax.plot(epochs, train_losses, 'b-', label='Train Loss', linewidth=2)
-    ax.plot(epochs, val_losses, 'r-', label='Val Loss', linewidth=2)
+    train_epochs = range(1, len(train_losses) + 1)
+    ax.plot(train_epochs, train_losses, 'b-', label='Train Loss', linewidth=2)
+    
+    # If val_epochs is provided, use it; otherwise assume same as train
+    if val_epochs is not None and len(val_losses) > 0:
+        ax.plot(val_epochs, val_losses, 'r-o', label='Val Loss', linewidth=2, markersize=6)
+    elif len(val_losses) > 0:
+        # Fallback: assume validation every epoch
+        val_plot_epochs = range(1, len(val_losses) + 1)
+        ax.plot(val_plot_epochs, val_losses, 'r-o', label='Val Loss', linewidth=2, markersize=6)
     
     ax.set_xlabel('Epoch', fontsize=12)
     ax.set_ylabel('Loss', fontsize=12)

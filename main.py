@@ -269,6 +269,7 @@ def train(config: Config):
     print(f"\nStarting training for {config.training.epochs} epochs...")
     train_losses = []
     val_losses = []
+    val_epochs = []  # Track which epochs we evaluated on
     
     for epoch in range(trainer.epoch + 1, config.training.epochs + 1):
         print(f"\n{'='*60}")
@@ -287,6 +288,7 @@ def train(config: Config):
         if epoch % config.training.eval_freq == 0:
             val_metrics = trainer.evaluate(val_loader, logger)
             val_losses.append(val_metrics['loss'])
+            val_epochs.append(epoch)  # Record the epoch number
             
             print(f"Val - Loss: {val_metrics['loss']:.4f}, "
                   f"Recon: {val_metrics['recon_loss']:.4f}, "
@@ -340,7 +342,7 @@ def train(config: Config):
     
     # Plot training curves
     curve_path = os.path.join(config.output_dir, 'training_curves.png')
-    plot_training_curves(train_losses, val_losses, curve_path)
+    plot_training_curves(train_losses, val_losses, curve_path, val_epochs)
     
     print(f"\n{'='*60}")
     print("Training completed!")

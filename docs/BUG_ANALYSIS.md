@@ -159,7 +159,61 @@ def build_scheduler(optimizer: torch.optim.Optimizer, config: Config):
 
 ---
 
-### 4. **사용되지 않는 변수** ✅ FIXED
+### 4. **Training Curves Plot 차원 불일치** ⭐⭐ ✅ FIXED
+
+**위치**: `utils/visualization.py`, line 285
+
+**문제:**
+```python
+# main.py
+train_losses = []  # 매 epoch 추가 → 10개
+val_losses = []    # eval_freq=5마다만 → epoch 5, 10 → 2개
+
+# visualization.py line 283-285
+epochs = range(1, len(train_losses) + 1)  # [1..10]
+ax.plot(epochs, train_losses, ...)  # OK: (10, 10)
+ax.plot(epochs, val_losses, ...)    # ERROR: (10, 2) ❌
+```
+
+**에러 메시지:**
+```
+ValueError: x and y must have same first dimension, but have shapes (10,) and (2,)
+```
+
+**근본 원인:**
+- Training loss는 매 epoch마다 기록 → 10개
+- Validation loss는 `eval_freq` (기본 5) 마다만 기록 → 2개
+- 같은 x축 (epochs)을 사용하려고 해서 차원 불일치
+
+**수정된 코드:**
+```python
+# main.py - val_epochs 추적 추가
+train_losses = []
+val_losses = []
+val_epochs = []  # ✅ 검증한 epoch 번호 기록
+
+for epoch in range(...):
+    train_losses.append(...)
+    if epoch % eval_freq == 0:
+        val_losses.append(...)
+        val_epochs.append(epoch)  # ✅ epoch 번호 저장
+
+# visualization.py - val_epochs 사용
+def plot_training_curves(train_losses, val_losses, save_path, val_epochs=None):
+    train_epochs = range(1, len(train_losses) + 1)
+    ax.plot(train_epochs, train_losses, ...)
+    
+    if val_epochs is not None:
+        ax.plot(val_epochs, val_losses, ...)  # ✅ 실제 검증한 epoch만
+```
+
+**영향**: 학습 완료 후 visualization 단계에서 크래시
+
+**상태**: ✅ **수정 완료** (2025-11-03)
+
+---
+
+### 5. **사용되지 않는 변수** ✅ FIXED
 
 **위치**: `models/infomae.py`, line 290
 
@@ -181,7 +235,7 @@ N_keep = x.shape[1]  # cls 추가 전 kept patches 수
 
 ## ⚠️ Major Issues (주요 문제)
 
-### 3. **Adaptive Masking의 비효율적인 조정 로직**
+### 6. **Adaptive Masking의 비효율적인 조정 로직**
 
 **위치**: `models/infomae.py`, line 227-256
 
@@ -232,7 +286,7 @@ def adaptive_masking_strategy(self, x, mask_ratio, alpha=3.0, gamma=1.0):
 
 ---
 
-### 4. **Surprisal EMA 업데이트 문제**
+### 7. **Surprisal EMA 업데이트 문제** ✅ FIXED
 
 **위치**: `models/infomae.py`, line 350-353
 
@@ -264,7 +318,7 @@ if self.training:
 
 ## 🔸 Minor Issues (경미한 문제)
 
-### 5. **get_attention_maps의 불일치**
+### 8. **get_attention_maps의 불일치**
 
 **위치**: `models/infomae.py`, line 370-395
 
@@ -298,7 +352,7 @@ def get_attention_maps(self, imgs, use_masking=False, mask_ratio=0.75):
 
 ---
 
-### 6. **Patchify/Unpatchify 하드코딩**
+### 9. **Patchify/Unpatchify 하드코딩**
 
 **위치**: `models/infomae.py`, line 176-196
 
@@ -325,7 +379,7 @@ def patchify(self, imgs):
 
 ---
 
-### 7. **Random Masking 시드 관리 없음**
+### 10. **Random Masking 시드 관리 없음**
 
 **위치**: `models/infomae.py`, line 198-216
 
@@ -368,15 +422,16 @@ Encoder/Decoder 분리가 잘 되어 있음
 2. ~~**Surprisal bias 차원 오류**~~ ✅ FIXED (2024-11-03)
 3. ~~**사용되지 않는 변수 제거**~~ ✅ FIXED (2024-11-03)
 4. ~~**CosineAnnealingLR T_max=0 에러**~~ ✅ FIXED (2025-11-03)
+5. ~~**Training curves plot 차원 불일치**~~ ✅ FIXED (2025-11-03)
 
 ### ⚡ 빠른 시일 내 수정:
-5. **Adaptive masking 효율성 개선**
-6. ~~**Surprisal EMA 업데이트 로직**~~ ✅ FIXED (2024-11-03)
+6. **Adaptive masking 효율성 개선**
+7. ~~**Surprisal EMA 업데이트 로직**~~ ✅ FIXED (2024-11-03)
 
 ### 📝 향후 개선:
-7. **get_attention_maps 옵션 추가**
-8. **Patchify 일반화**
-9. **시드 관리**
+8. **get_attention_maps 옵션 추가**
+9. **Patchify 일반화**
+10. **시드 관리**
 
 ---
 
@@ -451,16 +506,24 @@ N_with_cls = x.shape[0]  # 이 줄 삭제
 ## 🎯 결론
 
 **현재 상태:**
-- 🔴 **Critical Bug 1개** (즉시 수정 필요)
-- 🟡 **Major Issue 2개** (빠른 수정 권장)
-- 🟢 **Minor Issue 4개** (점진적 개선)
+- ✅ **Critical Bug 5개 모두 수정 완료!**
+- 🟡 **Major Issue 1개** (성능 최적화)
+- 🟢 **Minor Issue 3개** (점진적 개선)
+
+**수정 완료된 버그:**
+1. ✅ Mutual Information 텐서 차원 불일치
+2. ✅ Surprisal bias 차원 오류
+3. ✅ 사용되지 않는 변수 제거
+4. ✅ CosineAnnealingLR T_max=0 에러
+5. ✅ Training curves plot 차원 불일치
+6. ✅ Surprisal EMA 업데이트 로직
 
 **권장 조치:**
-1. 즉시: Surprisal bias 차원 수정
-2. 이번 주: Adaptive masking 최적화
-3. 다음 버전: 기타 개선사항
+1. ✅ 완료: 모든 critical bug 수정
+2. 향후: Adaptive masking 최적화 (성능 개선)
+3. 선택: 기타 개선사항 (편의성)
 
 **전체 평가:**
-핵심 아이디어는 좋으나, 구현에 몇 가지 버그가 있습니다.
-Critical bug만 수정하면 정상 작동할 것으로 예상됩니다.
+모든 critical bug가 수정되어 **이제 정상적으로 작동합니다!** 🎉
+Quick start 테스트가 성공적으로 완료되었으며, 학습 및 평가가 정상적으로 수행됩니다.
 
